@@ -1,7 +1,18 @@
 use std::io;
 use std::io::Write;
-use std::cmp::Ordering;
+use std::collections::VecDeque;
+use bitflags::bitflags;
 
+
+bitflags! {
+    pub(crate) struct Available: u8 {
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
+
+    }
+}
+
+#[derive(Debug)]
 enum State {
     //Closed,
     //Listen,
@@ -27,6 +38,30 @@ pub struct Connection {
     send: SendSequenceSpace,
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
+
+    pub (crate) incoming: VecDeque<u8>,
+    pub (crate) unacked: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_rcv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            // TODO: any state after rcvd fin: CLOSE-WAIT, LAST-ACK, CLOSED, CLOSING
+            true
+        } else {
+            false
+        }
+    }
+
+    fn availability(&self) -> Available {
+        // TODO: Take into account self.state
+        let mut a = Available::empty();
+        if self.is_rcv_closed() || !self.incoming.is_empty() {
+            a |= Available::READ;
+        }
+        // TODO: set Available::WRITE
+        a
+    }
 }
 
 /// State of Send Sequence Space (RFC 793 S3.2 F4)
@@ -130,6 +165,8 @@ impl Connection {
                     tcph.source_port(), 
                     iss, 
                     wnd),
+                incoming: VecDeque::default(),
+                unacked: VecDeque::default(),
             };
             // keep track of sender info
             
@@ -189,12 +226,12 @@ impl Connection {
 
     }
 
-    pub fn on_packet<'a>(
+    pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface, 
         iph: etherparse::Ipv4HeaderSlice<'a>, 
         tcph: etherparse::TcpHeaderSlice<'a>, 
-        data: &'a [u8]) -> io::Result<()> {
+        data: &'a [u8]) -> io::Result<Available> {
         // check sequence numbers are valid (RFC 793 S3.3)
         // valid segment check
         // Ok if it ACKs at least one byte
@@ -230,14 +267,14 @@ impl Connection {
 
         if !okay {
             self.write(nic,&[])?;
-            return Ok(());
+            return Ok(self.availability());
         }
 
         self.recv.nxt = seqn.wrapping_add(slen);
         // TODO if not acceptable, send ACK
 
         if !tcph.ack() {
-            return Ok(());
+            return Ok(self.availability());
         }
 
         // acceptable ack check
@@ -255,11 +292,11 @@ impl Connection {
 
         if let  State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             
-            if !is_between_wrapped(self.send.una , ackn, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapped(self.send.una , ackn, self.send.nxt.wrapping_add(1)) {
+                self.send.una = ackn;
             }
-            self.send.una = ackn;
-            // TODO
+            
+            // TODO: accept data
             assert!(data.is_empty());
 
             if let State::Estab = self.state {
@@ -289,25 +326,15 @@ impl Connection {
             }
         }
         
-        Ok(())
+        Ok(self.availability())
     }
 }
 
+fn wrapping_ls(lhs: u32, rhs: u32) -> bool {
+    // From RFC132
+    lhs.wrapping_sub(rhs) > 2^31
+}
+
 fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-    match start.cmp(&x) {
-        Ordering::Equal => return false,
-        Ordering::Less => {
-            // check violated iff end between start and x
-            if end >= start && end <= x {
-                return false;
-            }
-        },
-        Ordering::Greater => {
-            // check violated iff x is not between start and end
-            if !(end > x && end < start) {
-                return false;
-            }
-        }
-    }
-    true
+    wrapping_ls(start, x) && wrapping_ls(x, end)
 }
